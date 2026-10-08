@@ -1,0 +1,32 @@
+{
+    "name": "ksfraser/ksf-fa-serialnumber",
+    "description": "FrontAccounting module: serial number and batch traceability with location audit trail and warranty facts. Owns serial identity/location/warranty; not the warehouse hierarchy or RMA claims.",
+    "type": "project",
+    "license": "proprietary",
+    "authors": [
+        { "name": "Kevin Fraser", "email": "kevin@ksfraser.ca" }
+    ],
+    "require": {
+        "php": ">=7.3"
+    },
+    "config": {
+        "platform": {
+            "php": "7.4.33"
+        }
+    },
+    "minimum-stability": "dev",
+    "prefer-stable": true,
+    "require-dev": {
+        "phpunit/phpunit": "^9.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "ksfraser\\FrontAccounting\\SerialNumber\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "ksfraser\\FrontAccounting\\SerialNumber\\Tests\\": "tests/"
+        }
+    }
+}

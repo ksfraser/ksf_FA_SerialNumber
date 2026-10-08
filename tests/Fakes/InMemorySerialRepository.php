@@ -1,0 +1,166 @@
+<?php
+declare(strict_types=1);
+
+namespace ksfraser\FrontAccounting\SerialNumber\Tests\Fakes;
+
+use ksfraser\FrontAccounting\SerialNumber\Contracts\SerialRepositoryInterface;
+use ksfraser\FrontAccounting\SerialNumber\Dto\SerialMoveDto;
+use ksfraser\FrontAccounting\SerialNumber\Dto\SerialNumberDto;
+
+/**
+ * In-memory serial repository for unit tests.
+ *
+ * Services take a repository interface precisely so the lifecycle rules can be
+ * verified without a database. DTOs are cloned on the way in and out so a test
+ * cannot accidentally mutate stored state through a shared reference.
+ *
+ * @package ksfraser\FrontAccounting\SerialNumber\Tests\Fakes
+ * @since 1.0.0
+ */
+class InMemorySerialRepository implements SerialRepositoryInterface
+{
+    /** @var SerialNumberDto[] keyed by serial_no */
+    private $rows = array();
+
+    /** @var SerialMoveDto[] */
+    private $moves = array();
+
+    /** @var int */
+    private $nextId = 1;
+
+    /**
+     * @inheritDoc
+     */
+    public function insert(SerialNumberDto $serial): int
+    {
+        $id = $this->nextId++;
+        $serial->id = $id;
+        $this->rows[$serial->serialNo] = clone $serial;
+
+        return $id;
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function update(SerialNumberDto $serial): void
+    {
+        $this->rows[$serial->serialNo] = clone $serial;
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function findBySerialNo(string $serialNo): ?SerialNumberDto
+    {
+        return isset($this->rows[$serialNo]) ? clone $this->rows[$serialNo] : null;
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function findByItem(string $itemCode, ?string $status = null): array
+    {
+        $out = array();
+
+        foreach ($this->rows as $serial) {
+            if ($serial->itemCode !== $itemCode) {
+                continue;
+            }
+
+            if ($status !== null && $status !== '' && $serial->status !== $status) {
+                continue;
+            }
+
+            $out[] = clone $serial;
+        }
+
+        usort($out, function (SerialNumberDto $a, SerialNumberDto $b) {
+            return strcmp($a->serialNo, $b->serialNo);
+        });
+
+        return $out;
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function findByLocation(string $locCode, ?string $status = null): array
+    {
+        $out = array();
+
+        foreach ($this->rows as $serial) {
+            if ($serial->locCode !== $locCode) {
+                continue;
+            }
+
+            if ($status !== null && $status !== '' && $serial->status !== $status) {
+                continue;
+            }
+
+            $out[] = clone $serial;
+        }
+
+        return $out;
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function findByShelf(int $shelfId): array
+    {
+        $out = array();
+
+        foreach ($this->rows as $serial) {
+            if ($serial->shelfId === $shelfId) {
+                $out[] = clone $serial;
+            }
+        }
+
+        return $out;
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function appendMove(SerialMoveDto $move): void
+    {
+        $move->id = count($this->moves) + 1;
+        $this->moves[] = clone $move;
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function movesFor(string $serialNo): array
+    {
+        $out = array();
+
+        foreach ($this->moves as $move) {
+            if ($move->serialNo === $serialNo) {
+                $out[] = clone $move;
+            }
+        }
+
+        return array_reverse($out);
+    }
+
+    /**
+     * @inheritDoc
+     */
+    public function exists(string $serialNo): bool
+    {
+        return isset($this->rows[$serialNo]);
+    }
+
+    /**
+     * Seed a serial directly, bypassing the service (for edge-case setup).
+     *
+     * @param SerialNumberDto $serial
+     * @return void
+     */
+    public function seed(SerialNumberDto $serial): void
+    {
+        $this->insert($serial);
+    }
+}
