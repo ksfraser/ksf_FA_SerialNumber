@@ -1,4 +1,7 @@
 <?php
+/**
+ * @BABOK Related: FR-SN-001-001
+ */
 declare(strict_types=1);
 
 namespace ksfraser\FrontAccounting\SerialNumber\Dto;
