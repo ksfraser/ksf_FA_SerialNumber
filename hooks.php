@@ -222,7 +222,8 @@ class hooks_ksf_FA_SerialNumber extends hooks
     /**
      * Build the service and repositories, or null when the vendor is absent.
      *
-     * @return array|null [SerialNumberService, FaSerialRepository, FaBatchRepository, WarrantyService]
+     * @return array|null [SerialNumberService, FaSerialRepository, FaBatchRepository,
+     *                      WarrantyService, BatchNumberService, FaOwnershipRepository]
      */
     private function services()
     {
@@ -234,13 +235,18 @@ class hooks_ksf_FA_SerialNumber extends hooks
 
         $serialRepo = new $ns . 'Adapter\\FaSerialRepository'();
         $batchRepo = new $ns . 'Adapter\\FaBatchRepository'();
+        // Ownership is a separate append-only xref, so it gets its own repository.
+        // Leaving it null would make every sale refuse -- which is deliberate: a
+        // serialised unit sold with no owner recorded is worse than a refusal.
+        $ownerRepo = new $ns . 'Adapter\\FaOwnershipRepository'();
 
         return array(
-            new $ns . 'Service\\SerialNumberService'($serialRepo),
+            new $ns . 'Service\\SerialNumberService'($serialRepo, null, $ownerRepo),
             $serialRepo,
             $batchRepo,
             new $ns . 'Service\\WarrantyService'($serialRepo),
             new $ns . 'Service\\BatchNumberService'($batchRepo),
+            $ownerRepo,
         );
     }
 

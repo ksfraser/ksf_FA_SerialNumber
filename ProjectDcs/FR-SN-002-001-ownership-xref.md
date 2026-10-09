@@ -1,7 +1,7 @@
 # FR-SN-002-001 — Ownership history is an xref, not a mutable column
 
 @BABOK Related: BR-SN-001-002
-Status : **REQUIRED, NOT IMPLEMENTED**
+Status : Approved — implemented
 Module : ksf_FA_SerialNumber
 
 ## Need
@@ -57,17 +57,51 @@ ownership, which is worse than either alone.
 Existing `sold_to` values become one open xref row per serial, with
 `owned_from = sold_date` (or `purchase_date` when `sold_date` is null).
 
+## The one-open-row guarantee, and how it is actually enforced
+
+`UNIQUE KEY uniq_current_owner (serial_no, current_marker)` where
+
+```sql
+current_marker TINYINT(1) AS (IF(owned_to IS NULL, 1, NULL)) VIRTUAL
+```
+
+A plain `UNIQUE (serial_no, owned_to)` **does not work**: a UNIQUE index treats
+every NULL as distinct, so it would permit unlimited open rows for one serial.
+This was verified against the live MariaDB 10.11.14 before the schema was
+written — the naive key accepted a second open row, the generated column
+rejected it while still allowing any number of closed rows.
+
 ## Acceptance
 
-| Criterion | Status |
+| Criterion | Test |
 |---|---|
-| Selling a unit closes the previous owner row and opens a new one | not implemented |
-| A serial has at most one open ownership row | not implemented |
-| `owner_kind` is rejected if outside the closed set | not implemented |
-| Resale history is retained in full | not implemented |
-| Existing `sold_to` data migrates to one open row per serial | not implemented |
+| Selling a unit opens exactly one period | `testSellingOpensExactlyOnePeriod` |
+| A resale closes the previous period and keeps it on record | `testAResaleKeepsThePreviousOwnerInTheTrail` |
+| A serial never has two open owners | `testAUnitNeverHasTwoOpenOwners` |
+| History is oldest first | `testHistoryIsOldestFirst` |
+| `ownerAsAt` resolves a past owner | `testOwnerAsAtResolvesAPastOwner` |
+| Both ends of a period are inclusive | `testOwnerAsAtIncludesBothEndsOfAPeriod` |
+| Returning closes the period without deleting it | `testReturningClosesTheOwnershipPeriod` |
+| `owner_kind` outside the closed set is refused | `testAnUnrecognisedOwnerKindIsRefused` |
+| Every permitted kind is accepted | `testEveryPermittedOwnerKindIsAccepted` |
+| An empty owner reference is refused | `testAnEmptyOwnerReferenceIsRefused` |
+| `unitsHeldBy` finds a holder's current units | `testUnitsHeldByFindsEverythingOneOwnerCurrentlyHas` |
+| A returned unit is no longer listed as held | `testAReturnedUnitIsNoLongerListedAsHeld` |
+| Selling with no ownership repository refuses loudly | `testSellingWithoutAnOwnershipRepositoryIsRefusedLoudly` |
+
+Tests : `tests/Unit/OwnershipTest.php`
 
 ## Traceability
 
-@BABOK Note: blocks BR-SN-001-002. `SerialNumberService::markSold()` currently
-writes `sold_to` directly and must be reworked onto this xref.
+BRs : BR-SN-001-002 (now satisfied)
+UTs : UT-SN-002-001-001, UT-SN-002-001-002
+Implements : `OwnershipDto`, `OwnershipRepositoryInterface`,
+`FaOwnershipRepository`, and `SerialNumberService::markSold()` /
+`currentOwner()` / `ownershipHistory()` / `ownerAsAt()` / `unitsHeldBy()`.
+Migration is moot — the module was never activated with the old `sold_to`
+column, so the schema is installed clean.
+
+@BABOK Note: `returnSerial()` originally closed the ownership period with a bare
+`date('Y-m-d')`, ignoring the service's injected clock. Caught by
+`testAResaleKeepsThePreviousOwnerInTheTrail`; fixed by routing it through a
+`today()` helper so every date in the service honours the injected clock.

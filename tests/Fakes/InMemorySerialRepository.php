@@ -107,12 +107,17 @@ class InMemorySerialRepository implements SerialRepositoryInterface
     /**
      * @inheritDoc
      */
-    public function findByShelf(int $shelfId): array
+    public function findByFace(string $locCode, int $aisleId, int $shelfId, int $binId): array
     {
         $out = array();
 
         foreach ($this->rows as $serial) {
-            if ($serial->shelfId === $shelfId) {
+            // Every level must match: the warehouse ids are parent-scoped, so a
+            // bin number alone would match units on unrelated shelves.
+            if ($serial->locCode === $locCode
+                && $serial->aisleId === $aisleId
+                && $serial->shelfId === $shelfId
+                && $serial->binId === $binId) {
                 $out[] = clone $serial;
             }
         }

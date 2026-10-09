@@ -66,15 +66,20 @@ interface SerialRepositoryInterface
     public function findByLocation(string $locCode, ?string $status = null): array;
 
     /**
-     * Serials assigned to a warehouse shelf.
+     * Serials on one warehouse pick face.
      *
-     * Warehouse owns the hierarchy, so shelf_id is only an opaque reference
-     * here -- this module never resolves it to an aisle/bin.
+     * The full scoped key is required, not just a shelf: the warehouse's ids are
+     * meaningful indices scoped by parent, so shelf 2 of aisle 4 and shelf 2 of
+     * aisle 9 are different shelves and a bare shelf id is ambiguous. See
+     * FR-SN-003-001.
      *
-     * @param int $shelfId
+     * @param string $locCode
+     * @param int    $aisleId
+     * @param int    $shelfId
+     * @param int    $binId
      * @return SerialNumberDto[]
      */
-    public function findByShelf(int $shelfId): array;
+    public function findByFace(string $locCode, int $aisleId, int $shelfId, int $binId): array;
 
     /**
      * Append a location-change record to the audit trail.

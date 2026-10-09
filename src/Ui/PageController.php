@@ -160,9 +160,12 @@ class PageController
         label_row(_('Serial'), $serial->serialNo);
         label_row(_('Item'), $serial->itemCode);
         label_row(_('Status'), $serial->status);
+        // The pick face is the whole scoped key, and the BIN is what a picker
+        // reaches into -- so it is listed last, as the operative position.
         label_row(_('Location'), (string)$serial->locCode);
+        label_row(_('Aisle'), $serial->aisleId === null ? '' : (string)$serial->aisleId);
         label_row(_('Shelf'), $serial->shelfId === null ? '' : (string)$serial->shelfId);
-        label_row(_('Sold to'), (string)$serial->soldTo);
+        label_row(_('Bin'), $serial->binId === null ? '' : (string)$serial->binId);
 
         $covered = $this->warranty->isCovered($serial);
         $days = $this->warranty->daysRemaining($serial);

@@ -49,21 +49,22 @@ class FaSerialRepository implements SerialRepositoryInterface
     public function insert(SerialNumberDto $serial): int
     {
         $sql = "INSERT INTO " . $this->table() . " (serial_no, item_code, status, loc_code,
-            shelf_id, batch_no, supplier_ref, purchase_date, purchase_cost, currency,
-            sold_to, sold_date, installed_date, warranty_end, notes, created_at, updated_at)
+            aisle_id, shelf_id, bin_id, batch_no, supplier_ref, purchase_date,
+            purchase_cost, currency, installed_date, warranty_end, notes,
+            created_at, updated_at)
             VALUES ("
             . db_escape($serial->serialNo) . ', '
             . db_escape($serial->itemCode) . ', '
             . db_escape($serial->status) . ', '
             . $this->sqlNullableString($serial->locCode) . ', '
+            . $this->sqlNullableInt($serial->aisleId) . ', '
             . $this->sqlNullableInt($serial->shelfId) . ', '
+            . $this->sqlNullableInt($serial->binId) . ', '
             . $this->sqlNullableString($serial->batchNo) . ', '
             . $this->sqlNullableString($serial->supplierRef) . ', '
             . $this->sqlNullableString($serial->purchaseDate) . ', '
             . $this->sqlNullableFloat($serial->purchaseCost) . ', '
             . $this->sqlNullableString($serial->currency) . ', '
-            . $this->sqlNullableString($serial->soldTo) . ', '
-            . $this->sqlNullableString($serial->soldDate) . ', '
             . $this->sqlNullableString($serial->installedDate) . ', '
             . $this->sqlNullableString($serial->warrantyEnd) . ', '
             . db_escape($serial->notes) . ', '
@@ -85,14 +86,14 @@ class FaSerialRepository implements SerialRepositoryInterface
             item_code = " . db_escape($serial->itemCode) . ',
             status = ' . db_escape($serial->status) . ',
             loc_code = ' . $this->sqlNullableString($serial->locCode) . ',
+            aisle_id = ' . $this->sqlNullableInt($serial->aisleId) . ',
             shelf_id = ' . $this->sqlNullableInt($serial->shelfId) . ',
+            bin_id = ' . $this->sqlNullableInt($serial->binId) . ',
             batch_no = ' . $this->sqlNullableString($serial->batchNo) . ',
             supplier_ref = ' . $this->sqlNullableString($serial->supplierRef) . ',
             purchase_date = ' . $this->sqlNullableString($serial->purchaseDate) . ',
             purchase_cost = ' . $this->sqlNullableFloat($serial->purchaseCost) . ',
             currency = ' . $this->sqlNullableString($serial->currency) . ',
-            sold_to = ' . $this->sqlNullableString($serial->soldTo) . ',
-            sold_date = ' . $this->sqlNullableString($serial->soldDate) . ',
             installed_date = ' . $this->sqlNullableString($serial->installedDate) . ',
             warranty_end = ' . $this->sqlNullableString($serial->warrantyEnd) . ',
             notes = ' . db_escape($serial->notes) . ',
@@ -154,11 +155,17 @@ class FaSerialRepository implements SerialRepositoryInterface
     /**
      * @inheritDoc
      */
-    public function findByShelf(int $shelfId): array
+    public function findByFace(string $locCode, int $aisleId, int $shelfId, int $binId): array
     {
+        // Every level of the key is compared: the warehouse ids are meaningful
+        // indices scoped by parent, so matching on bin alone would return units
+        // from every aisle and shelf that happens to reuse the number.
         return $this->fetchAll(
             "SELECT * FROM " . $this->table()
-            . " WHERE shelf_id = " . (int)$shelfId
+            . " WHERE loc_code = " . db_escape($locCode)
+            . " AND aisle_id = " . (int)$aisleId
+            . " AND shelf_id = " . (int)$shelfId
+            . " AND bin_id = " . (int)$binId
             . " ORDER BY item_code, serial_no"
         );
     }
@@ -169,12 +176,18 @@ class FaSerialRepository implements SerialRepositoryInterface
     public function appendMove(SerialMoveDto $move): void
     {
         $sql = "INSERT INTO " . $this->logTable() . " (serial_no, from_loc_code, to_loc_code,
-            from_shelf_id, to_shelf_id, reason, moved_by, moved_at) VALUES ("
+            from_aisle_id, from_shelf_id, from_bin_id,
+            to_aisle_id, to_shelf_id, to_bin_id,
+            reason, moved_by, moved_at) VALUES ("
             . db_escape($move->serialNo) . ', '
             . $this->sqlNullableString($move->fromLocCode) . ', '
             . $this->sqlNullableString($move->toLocCode) . ', '
+            . $this->sqlNullableInt($move->fromAisleId) . ', '
             . $this->sqlNullableInt($move->fromShelfId) . ', '
+            . $this->sqlNullableInt($move->fromBinId) . ', '
+            . $this->sqlNullableInt($move->toAisleId) . ', '
             . $this->sqlNullableInt($move->toShelfId) . ', '
+            . $this->sqlNullableInt($move->toBinId) . ', '
             . db_escape($move->reason) . ', '
             . $this->sqlNullableString($move->movedBy) . ', '
             . db_escape($move->movedAt)
@@ -205,8 +218,12 @@ class FaSerialRepository implements SerialRepositoryInterface
             $move->serialNo = (string)$row['serial_no'];
             $move->fromLocCode = $row['from_loc_code'];
             $move->toLocCode = $row['to_loc_code'];
-            $move->fromShelfId = $row['from_shelf_id'] === null ? null : (int)$row['from_shelf_id'];
-            $move->toShelfId = $row['to_shelf_id'] === null ? null : (int)$row['to_shelf_id'];
+            $move->fromAisleId = self::nullableInt($row['from_aisle_id']);
+            $move->fromShelfId = self::nullableInt($row['from_shelf_id']);
+            $move->fromBinId   = self::nullableInt($row['from_bin_id']);
+            $move->toAisleId   = self::nullableInt($row['to_aisle_id']);
+            $move->toShelfId   = self::nullableInt($row['to_shelf_id']);
+            $move->toBinId     = self::nullableInt($row['to_bin_id']);
             $move->reason = (string)$row['reason'];
             $move->movedBy = $row['moved_by'];
             $move->movedAt = (string)$row['moved_at'];
@@ -259,19 +276,28 @@ class FaSerialRepository implements SerialRepositoryInterface
         $serial->id = (int)$row['id'];
         $serial->status = (string)$row['status'];
         $serial->locCode = $row['loc_code'];
-        $serial->shelfId = $row['shelf_id'] === null ? null : (int)$row['shelf_id'];
+        $serial->aisleId = self::nullableInt($row['aisle_id']);
+        $serial->shelfId = self::nullableInt($row['shelf_id']);
+        $serial->binId   = self::nullableInt($row['bin_id']);
         $serial->batchNo = $row['batch_no'];
         $serial->supplierRef = $row['supplier_ref'];
         $serial->purchaseDate = $row['purchase_date'];
         $serial->purchaseCost = $row['purchase_cost'] === null ? null : (float)$row['purchase_cost'];
         $serial->currency = $row['currency'];
-        $serial->soldTo = $row['sold_to'];
-        $serial->soldDate = $row['sold_date'];
         $serial->installedDate = $row['installed_date'];
         $serial->warrantyEnd = $row['warranty_end'];
         $serial->notes = (string)$row['notes'];
 
         return $serial;
+    }
+
+    /**
+     * @param mixed $value
+     * @return int|null
+     */
+    private static function nullableInt($value): ?int
+    {
+        return $value === null ? null : (int)$value;
     }
 
     /**

@@ -27,10 +27,14 @@ class SerialMoveDto
     public $toLocCode = null;
 
     /** @var int|null Origin shelf. */
+    public $fromAisleId = null;
     public $fromShelfId = null;
+    public $fromBinId = null;
 
     /** @var int|null Destination shelf. */
+    public $toAisleId = null;
     public $toShelfId = null;
+    public $toBinId = null;
 
     /** @var string Why the unit moved (receipt, transfer, return, write-off...). */
     public $reason = '';

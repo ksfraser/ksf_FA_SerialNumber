@@ -11,6 +11,7 @@ use ksfraser\FrontAccounting\SerialNumber\Dto\SerialNumberDto;
 use ksfraser\FrontAccounting\SerialNumber\Exception\SerialNotFoundException;
 use ksfraser\FrontAccounting\SerialNumber\Service\SerialNumberService;
 use ksfraser\FrontAccounting\SerialNumber\Service\WarrantyService;
+use ksfraser\FrontAccounting\SerialNumber\Tests\Fakes\InMemoryOwnershipRepository;
 use ksfraser\FrontAccounting\SerialNumber\Tests\Fakes\InMemorySerialRepository;
 
 /**
@@ -33,7 +34,13 @@ class WarrantyServiceTest extends TestCase
     protected function setUp(): void
     {
         $this->repo = new InMemorySerialRepository();
-        $this->serials = new SerialNumberService($this->repo, '2026-03-01 09:00:00');
+        // The ownership xref is wired in because selling a unit now records an
+        // owner; without it markSold() would refuse rather than silently skip.
+        $this->serials = new SerialNumberService(
+            $this->repo,
+            '2026-03-01 09:00:00',
+            new InMemoryOwnershipRepository()
+        );
         $this->warranty = new WarrantyService($this->repo, '2026-03-01');
     }
 

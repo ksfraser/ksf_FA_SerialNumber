@@ -1,13 +1,17 @@
 <?php
 /**
- * @BABOK Related: FR-SN-001-001
+ * @BABOK Related: FR-SN-001-001, FR-SN-003-001
  */
 declare(strict_types=1);
 
 namespace ksfraser\FrontAccounting\SerialNumber\Dto;
 
 /**
- * A serialised unit: identity, location, lifecycle state and warranty facts.
+ * A serialised unit: identity, pick face, lifecycle state and warranty facts.
+ *
+ * Ownership is deliberately NOT here -- it lives in the append-only
+ * 0_ksf_serial_ownership xref (FR-SN-002-001) because it has history, while this
+ * row describes the unit's current state.
  *
  * PHP 7.3 compatible: properties are untyped and every one carries a default.
  * A typed property without a default is uninitialised, and reading it throws
@@ -41,8 +45,26 @@ class SerialNumberDto
     /** @var string|null FA location code (0_locations.loc_code). */
     public $locCode = null;
 
-    /** @var int|null Warehouse shelf id. Opaque here; warehouse resolves it. */
+    /**
+     * @var int|null Warehouse aisle index. Location-scoped, not globally unique.
+     *
+     * Part of the full pick-face key -- see FR-SN-003-001. A bare shelf id is
+     * ambiguous: shelf 2 of aisle 4 and shelf 2 of aisle 9 are different shelves,
+     * because the warehouse keys are meaningful indices scoped by parent.
+     */
+    public $aisleId = null;
+
+    /** @var int|null Warehouse shelf index, scoped by (loc_code, aisle_id). */
     public $shelfId = null;
+
+    /**
+     * @var int|null Warehouse bin index -- THE PICK FACE.
+     *
+     * The bin is the compartment a picker reaches into; the shelf is the rack it
+     * sits on. Resolving a serial to a shelf but not a bin leaves "which box is it
+     * in" unanswerable. See FR-SN-003-001.
+     */
+    public $binId = null;
 
     /** @var string|null Parent batch number. */
     public $batchNo = null;
@@ -58,12 +80,6 @@ class SerialNumberDto
 
     /** @var string|null ISO currency code. */
     public $currency = null;
-
-    /** @var string|null Customer identifier once sold. */
-    public $soldTo = null;
-
-    /** @var string|null 'Y-m-d'. */
-    public $soldDate = null;
 
     /** @var string|null 'Y-m-d'; drives the warranty clock. */
     public $installedDate = null;
@@ -82,6 +98,43 @@ class SerialNumberDto
     {
         $this->serialNo = $serialNo;
         $this->itemCode = $itemCode;
+    }
+
+    /**
+     * The full warehouse pick-face key, or null when the unit is not shelved.
+     *
+     * This is the only safe way to address a serial's position, because the
+     * warehouse's ids are meaningful and parent-scoped. A partial key -- shelf
+     * without aisle, say -- is ambiguous and must not be persisted or joined on.
+     *
+     * @return array{loc_code:string,aisle_id:int,shelf_id:int,bin_id:int}|null
+     */
+    public function pickFace(): ?array
+    {
+        if ($this->locCode === null || $this->locCode === ''
+            || $this->aisleId === null || $this->shelfId === null || $this->binId === null) {
+            return null;
+        }
+
+        return array(
+            'loc_code' => $this->locCode,
+            'aisle_id' => (int)$this->aisleId,
+            'shelf_id' => (int)$this->shelfId,
+            'bin_id'   => (int)$this->binId,
+        );
+    }
+
+    /**
+     * Is this unit on a real, resolvable pick face?
+     *
+     * Distinguishes "at a location" from "on a specific bin". Goods-in lands on
+     * the reserved UNASSIGNED face, which IS a real bin, so both are true there.
+     *
+     * @return bool
+     */
+    public function isShelved(): bool
+    {
+        return $this->pickFace() !== null;
     }
 
     /**
@@ -111,14 +164,14 @@ class SerialNumberDto
             'item_code'      => $this->itemCode,
             'status'         => $this->status,
             'loc_code'       => $this->locCode,
+            'aisle_id'       => $this->aisleId,
             'shelf_id'       => $this->shelfId,
+            'bin_id'         => $this->binId,
             'batch_no'       => $this->batchNo,
             'supplier_ref'   => $this->supplierRef,
             'purchase_date'  => $this->purchaseDate,
             'purchase_cost'  => $this->purchaseCost,
             'currency'       => $this->currency,
-            'sold_to'        => $this->soldTo,
-            'sold_date'      => $this->soldDate,
             'installed_date' => $this->installedDate,
             'warranty_end'   => $this->warrantyEnd,
             'notes'          => $this->notes,

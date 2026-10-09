@@ -1,17 +1,19 @@
 <?php
 /**
- * @BABOK Related: FR-SN-001-001, FR-SN-001-002
+ * @BABOK Related: FR-SN-001-001, FR-SN-001-002, FR-SN-002-001, FR-SN-003-001
  */
 declare(strict_types=1);
 
 namespace ksfraser\FrontAccounting\SerialNumber\Tests\Unit;
 
 use PHPUnit\Framework\TestCase;
+use ksfraser\FrontAccounting\SerialNumber\Dto\OwnershipDto;
 use ksfraser\FrontAccounting\SerialNumber\Dto\SerialNumberDto;
 use ksfraser\FrontAccounting\SerialNumber\Exception\DuplicateSerialException;
 use ksfraser\FrontAccounting\SerialNumber\Exception\InvalidSerialStateException;
 use ksfraser\FrontAccounting\SerialNumber\Exception\SerialNotFoundException;
 use ksfraser\FrontAccounting\SerialNumber\Service\SerialNumberService;
+use ksfraser\FrontAccounting\SerialNumber\Tests\Fakes\InMemoryOwnershipRepository;
 use ksfraser\FrontAccounting\SerialNumber\Tests\Fakes\InMemorySerialRepository;
 
 /**
@@ -25,13 +27,40 @@ class SerialNumberServiceTest extends TestCase
     /** @var InMemorySerialRepository */
     private $repo;
 
+    /** @var InMemoryOwnershipRepository */
+    private $owners;
+
     /** @var SerialNumberService */
     private $service;
 
     protected function setUp(): void
     {
         $this->repo = new InMemorySerialRepository();
-        $this->service = new SerialNumberService($this->repo, '2026-03-01 09:00:00');
+        $this->owners = new InMemoryOwnershipRepository();
+        $this->service = new SerialNumberService(
+            $this->repo,
+            '2026-03-01 09:00:00',
+            $this->owners
+        );
+    }
+
+    /**
+     * A complete pick face, for tests that need a shelved unit.
+     *
+     * @param string $locCode
+     * @param int    $aisle
+     * @param int    $shelf
+     * @param int    $bin
+     * @return array
+     */
+    private function face(string $locCode = 'MAIN', int $aisle = 4, int $shelf = 2, int $bin = 3): array
+    {
+        return array(
+            'locCode' => $locCode,
+            'aisleId' => $aisle,
+            'shelfId' => $shelf,
+            'binId'   => $bin,
+        );
     }
 
     public function testRegisterCreatesAvailableSerial(): void
@@ -70,14 +99,16 @@ class SerialNumberServiceTest extends TestCase
 
     public function testRegisterWithLocationLogsReceipt(): void
     {
-        $this->service->register('SN-003', 'WIDGET', array('locCode' => 'MAIN', 'shelfId' => 42));
+        $this->service->register('SN-003', 'WIDGET', $this->face('MAIN', 1, 2, 42));
 
         $history = $this->service->history('SN-003');
         $this->assertCount(1, $history, 'receiving into a location must be audited');
         $this->assertSame('receipt', $history[0]->reason);
         $this->assertNull($history[0]->fromLocCode);
         $this->assertSame('MAIN', $history[0]->toLocCode);
-        $this->assertSame(42, $history[0]->toShelfId);
+        $this->assertSame(1, $history[0]->toAisleId);
+        $this->assertSame(2, $history[0]->toShelfId);
+        $this->assertSame(42, $history[0]->toBinId, 'the bin is the pick face');
     }
 
     public function testRegisterWithoutLocationLogsNothing(): void
@@ -94,25 +125,31 @@ class SerialNumberServiceTest extends TestCase
 
     public function testMoveRecordsBothEnds(): void
     {
-        $this->service->register('SN-005', 'WIDGET', array('locCode' => 'MAIN'));
-        $this->service->move('SN-005', 'DEPOT', 77, 'transfer');
+        $this->service->register('SN-005', 'WIDGET', $this->face());
+        $this->service->move('SN-005', 'DEPOT', 1, 5, 77, 'transfer');
 
         $serial = $this->service->get('SN-005');
         $this->assertSame('DEPOT', $serial->locCode);
-        $this->assertSame(77, $serial->shelfId);
+        $this->assertSame(1, $serial->aisleId);
+        $this->assertSame(5, $serial->shelfId);
+        $this->assertSame(77, $serial->binId, 'the bin is the pick face');
 
         $history = $this->service->history('SN-005');
         $this->assertCount(2, $history);
         $this->assertSame('transfer', $history[0]->reason);
         $this->assertSame('MAIN', $history[0]->fromLocCode);
         $this->assertSame('DEPOT', $history[0]->toLocCode);
-        $this->assertSame(77, $history[0]->toShelfId);
-        $this->assertNull($history[0]->fromShelfId, 'the unit had no shelf before this move');
+        $this->assertSame(5, $history[0]->toShelfId);
+        $this->assertSame(77, $history[0]->toBinId);
+        // It was received on the default face, so "from" is that face, not null.
+        $this->assertSame(4, $history[0]->fromAisleId);
+        $this->assertSame(2, $history[0]->fromShelfId);
+        $this->assertSame(3, $history[0]->fromBinId);
     }
 
     public function testMoveRetiredSerialIsRejected(): void
     {
-        $this->service->register('SN-006', 'WIDGET', array('locCode' => 'MAIN'));
+        $this->service->register('SN-006', 'WIDGET', $this->face());
         $this->service->retire('SN-006');
 
         $this->expectException(InvalidSerialStateException::class);
@@ -121,7 +158,7 @@ class SerialNumberServiceTest extends TestCase
 
     public function testReserveAndUnreserveRoundTrip(): void
     {
-        $this->service->register('SN-007', 'WIDGET', array('locCode' => 'MAIN'));
+        $this->service->register('SN-007', 'WIDGET', $this->face());
 
         $reserved = $this->service->reserve('SN-007');
         $this->assertSame(SerialNumberDto::STATUS_RESERVED, $reserved->status);
@@ -132,12 +169,15 @@ class SerialNumberServiceTest extends TestCase
 
     public function testMarkSoldStartsWarrantyFromInstallDate(): void
     {
-        $this->service->register('SN-008', 'WIDGET', array('locCode' => 'MAIN'));
+        $this->service->register('SN-008', 'WIDGET', $this->face());
 
         $sold = $this->service->markSold('SN-008', 'CUST-1', '2026-03-01', 730);
 
         $this->assertSame(SerialNumberDto::STATUS_INSTALLED, $sold->status);
-        $this->assertSame('CUST-1', $sold->soldTo);
+        $owner = $this->service->currentOwner('SN-008');
+        $this->assertNotNull($owner, 'selling must record an owner');
+        $this->assertSame('CUST-1', $owner->ownerRef);
+        $this->assertSame(OwnershipDto::KIND_DEBTOR, $owner->ownerKind);
         $this->assertSame('2026-03-01', $sold->installedDate);
         $this->assertSame('2028-02-29', $sold->warrantyEnd, '730 days from 2026-03-01');
         $this->assertTrue($sold->isWarrantyRunning());
@@ -162,7 +202,7 @@ class SerialNumberServiceTest extends TestCase
 
     public function testMarkSoldLeavesAuditEntry(): void
     {
-        $this->service->register('SN-011', 'WIDGET', array('locCode' => 'MAIN'));
+        $this->service->register('SN-011', 'WIDGET', $this->face());
         $this->service->markSold('SN-011', 'CUST-1', '2026-03-01', 365);
 
         $history = $this->service->history('SN-011');
@@ -171,14 +211,16 @@ class SerialNumberServiceTest extends TestCase
 
     public function testReturnClearsCustomerAndWarranty(): void
     {
-        $this->service->register('SN-012', 'WIDGET', array('locCode' => 'MAIN'));
+        $this->service->register('SN-012', 'WIDGET', $this->face());
         $this->service->markSold('SN-012', 'CUST-1', '2026-03-01', 365);
 
         $returned = $this->service->returnSerial('SN-012');
 
         $this->assertSame(SerialNumberDto::STATUS_RETURNED, $returned->status);
-        $this->assertNull($returned->soldTo);
-        $this->assertNull($returned->soldDate);
+        $this->assertNull(
+            $this->service->currentOwner('SN-012'),
+            'returning must close the ownership period'
+        );
         $this->assertNull($returned->installedDate);
         $this->assertNull($returned->warrantyEnd, 'returning a unit stops the warranty clock');
     }
@@ -193,7 +235,7 @@ class SerialNumberServiceTest extends TestCase
 
     public function testPutBackInStockReopensAvailability(): void
     {
-        $this->service->register('SN-014', 'WIDGET', array('locCode' => 'MAIN'));
+        $this->service->register('SN-014', 'WIDGET', $this->face());
         $this->service->markSold('SN-014', 'CUST-1', '2026-03-01', 365);
         $this->service->returnSerial('SN-014');
 
@@ -205,7 +247,7 @@ class SerialNumberServiceTest extends TestCase
 
     public function testRetireIsTerminalAndIdempotent(): void
     {
-        $this->service->register('SN-015', 'WIDGET', array('locCode' => 'MAIN'));
+        $this->service->register('SN-015', 'WIDGET', $this->face());
 
         $retired = $this->service->retire('SN-015');
         $this->assertSame(SerialNumberDto::STATUS_RETIRED, $retired->status);
@@ -247,10 +289,10 @@ class SerialNumberServiceTest extends TestCase
 
     public function testCountAtLocationIgnoresRetired(): void
     {
-        $this->service->register('SN-020', 'WIDGET', array('locCode' => 'MAIN'));
-        $this->service->register('SN-021', 'WIDGET', array('locCode' => 'MAIN'));
-        $this->service->register('SN-022', 'WIDGET', array('locCode' => 'MAIN'));
-        $this->service->register('SN-023', 'GADGET', array('locCode' => 'MAIN'));
+        $this->service->register('SN-020', 'WIDGET', $this->face());
+        $this->service->register('SN-021', 'WIDGET', $this->face());
+        $this->service->register('SN-022', 'WIDGET', $this->face());
+        $this->service->register('SN-023', 'GADGET', $this->face());
         $this->service->retire('SN-022');
 
         $this->assertSame(2, $this->service->countAtLocation('WIDGET', 'MAIN'));
@@ -260,7 +302,7 @@ class SerialNumberServiceTest extends TestCase
     {
         // An installed unit keeps its last known loc_code, so it still counts as
         // physically present until it is moved or returned.
-        $this->service->register('SN-024', 'WIDGET', array('locCode' => 'MAIN'));
+        $this->service->register('SN-024', 'WIDGET', $this->face());
         $this->service->markSold('SN-024', 'CUST-1', '2026-03-01', 365);
 
         $this->assertSame(1, $this->service->countAtLocation('WIDGET', 'MAIN'));
@@ -268,9 +310,9 @@ class SerialNumberServiceTest extends TestCase
 
     public function testHistoryIsNewestFirst(): void
     {
-        $this->service->register('SN-025', 'WIDGET', array('locCode' => 'MAIN'));
-        $this->service->move('SN-025', 'DEPOT', null, 'transfer');
-        $this->service->move('SN-025', 'MAIN', null, 'transfer-back');
+        $this->service->register('SN-025', 'WIDGET', $this->face());
+        $this->service->move('SN-025', 'DEPOT', 4, 2, 3, 'transfer');
+        $this->service->move('SN-025', 'MAIN', 4, 2, 3, 'transfer-back');
 
         $history = $this->service->history('SN-025');
 

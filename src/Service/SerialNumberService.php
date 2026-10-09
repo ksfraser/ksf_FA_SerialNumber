@@ -1,12 +1,14 @@
 <?php
 /**
- * @BABOK Related: FR-SN-001-001, FR-SN-001-002
+ * @BABOK Related: FR-SN-001-001, FR-SN-001-002, FR-SN-002-001, FR-SN-003-001
  */
 declare(strict_types=1);
 
 namespace ksfraser\FrontAccounting\SerialNumber\Service;
 
+use ksfraser\FrontAccounting\SerialNumber\Contracts\OwnershipRepositoryInterface;
 use ksfraser\FrontAccounting\SerialNumber\Contracts\SerialRepositoryInterface;
+use ksfraser\FrontAccounting\SerialNumber\Dto\OwnershipDto;
 use ksfraser\FrontAccounting\SerialNumber\Dto\SerialMoveDto;
 use ksfraser\FrontAccounting\SerialNumber\Dto\SerialNumberDto;
 use ksfraser\FrontAccounting\SerialNumber\Exception\DuplicateSerialException;
@@ -22,8 +24,8 @@ use ksfraser\FrontAccounting\SerialNumber\Exception\SerialNotFoundException;
  *
  * The allowed transitions are deliberate and closed. A unit that has been sold
  * and installed cannot go back to 'available' by a bare status write -- it must
- * come back through returnSerial(), which clears sold_to and restarts the
- * warranty clock on the new install.
+ * come back through returnSerial(), which closes the ownership period and
+ * restarts the warranty clock on the new install.
  *
  * @package ksfraser\FrontAccounting\SerialNumber\Service
  * @since 1.0.0
@@ -65,6 +67,14 @@ class SerialNumberService
     /** @var SerialRepositoryInterface */
     private $repo;
 
+    /**
+     * @var OwnershipRepositoryInterface|null
+     *
+     * Optional so the module keeps working before the ownership xref is wired in;
+     * every method that needs it refuses loudly rather than silently skipping.
+     */
+    private $owners;
+
     /** @var string Clock injection point; 'Y-m-d H:i:s'. */
     private $now;
 
@@ -72,10 +82,33 @@ class SerialNumberService
      * @param SerialRepositoryInterface $repo
      * @param string|null $now Fixed timestamp for deterministic tests.
      */
-    public function __construct(SerialRepositoryInterface $repo, ?string $now = null)
-    {
+    public function __construct(
+        SerialRepositoryInterface $repo,
+        ?string $now = null,
+        ?OwnershipRepositoryInterface $owners = null
+    ) {
         $this->repo = $repo;
         $this->now = $now;
+        $this->owners = $owners;
+    }
+
+    /**
+     * The ownership history repository.
+     *
+     * @return OwnershipRepositoryInterface
+     * @throws InvalidSerialStateException When it was not supplied. Refusing beats
+     *         silently recording no ownership, which is how the old sold_to
+     *         column came to be the only record of who owned a unit.
+     */
+    private function owners(): OwnershipRepositoryInterface
+    {
+        if ($this->owners === null) {
+            throw new InvalidSerialStateException(
+                'No ownership repository configured; ownership cannot be recorded'
+            );
+        }
+
+        return $this->owners;
     }
 
     /**
@@ -83,9 +116,9 @@ class SerialNumberService
      *
      * @param string $serialNo
      * @param string $itemCode
-     * @param array  $attributes Optional overrides (locCode, shelfId, batchNo,
-     *                           purchaseDate, purchaseCost, currency, supplierRef,
-     *                           warrantyEnd, notes).
+     * @param array  $attributes Optional overrides (locCode, aisleId, shelfId,
+     *                           binId, batchNo, purchaseDate, purchaseCost,
+     *                           currency, supplierRef, warrantyEnd, notes).
      * @return SerialNumberDto
      * @throws DuplicateSerialException When the serial already exists.
      */
@@ -109,8 +142,8 @@ class SerialNumberService
         $serial->status = SerialNumberDto::STATUS_AVAILABLE;
 
         foreach (array(
-            'locCode', 'shelfId', 'batchNo', 'supplierRef', 'purchaseDate',
-            'purchaseCost', 'currency', 'warrantyEnd', 'notes',
+            'locCode', 'aisleId', 'shelfId', 'binId', 'batchNo', 'supplierRef',
+            'purchaseDate', 'purchaseCost', 'currency', 'warrantyEnd', 'notes',
         ) as $field) {
             if (array_key_exists($field, $attributes)) {
                 $serial->{$field} = $attributes[$field];
@@ -119,8 +152,11 @@ class SerialNumberService
 
         $serial->id = $this->repo->insert($serial);
 
-        if ($serial->locCode !== null || $serial->shelfId !== null) {
-            $this->logMove($serial, null, null, 'receipt');
+        // No face at all is fine -- the unit has simply not been put away yet.
+        $this->assertFaceIsWholeOrAbsent($serial, $serialNo);
+
+        if ($serial->locCode !== null) {
+            $this->logMove($serial, null, 'receipt');
         }
 
         return $serial;
@@ -145,16 +181,29 @@ class SerialNumberService
     /**
      * Place a unit at a location (receiving it into stock, or returning it).
      *
-     * @param string      $serialNo
-     * @param string      $locCode  FA location code.
-     * @param int|null    $shelfId  Optional warehouse shelf.
-     * @param string      $reason
+     * The whole scoped key is required. A shelf id on its own is ambiguous, because
+     * the warehouse's ids are meaningful indices scoped by parent: shelf 2 of
+     * aisle 4 and shelf 2 of aisle 9 are different shelves. Goods-in passes the
+     * reserved UNASSIGNED face, which is a real bin like any other.
+     *
+     * @param string   $serialNo
+     * @param string   $locCode  FA location code.
+     * @param int|null $aisleId
+     * @param int|null $shelfId
+     * @param int|null $binId   The pick face.
+     * @param string   $reason
      * @return SerialNumberDto
      * @throws SerialNotFoundException
-     * @throws InvalidSerialStateException When retired.
+     * @throws InvalidSerialStateException When retired, or the face is incomplete.
      */
-    public function assignLocation(string $serialNo, string $locCode, ?int $shelfId = null, string $reason = 'assign'): SerialNumberDto
-    {
+    public function assignLocation(
+        string $serialNo,
+        string $locCode,
+        ?int $aisleId = null,
+        ?int $shelfId = null,
+        ?int $binId = null,
+        string $reason = 'assign'
+    ): SerialNumberDto {
         $serial = $this->get($serialNo);
 
         if ($serial->status === SerialNumberDto::STATUS_RETIRED) {
@@ -163,16 +212,56 @@ class SerialNumberService
             );
         }
 
-        $fromLoc = $serial->locCode;
-        $fromShelf = $serial->shelfId;
+        $from = $serial->pickFace();
 
         $serial->locCode = $locCode;
+        $serial->aisleId = $aisleId;
         $serial->shelfId = $shelfId;
+        $serial->binId = $binId;
+
+        $this->assertFaceIsWholeOrAbsent($serial, $serialNo);
 
         $this->repo->update($serial);
-        $this->logMove($serial, $fromLoc, $fromShelf, $reason);
+        $this->logMove($serial, $from, $reason);
 
         return $serial;
+    }
+
+    /**
+     * The face is either wholly specified or wholly absent -- never partial.
+     *
+     * A PARTIAL face is ambiguous and must be refused: the warehouse's ids are
+     * meaningful indices scoped by parent, so a shelf without an aisle cannot be
+     * resolved to a real position. An ABSENT face is legitimate -- the unit has
+     * not been put away yet, or has left the building.
+     *
+     * @param SerialNumberDto $serial
+     * @param string          $serialNo For the message.
+     * @return void
+     * @throws InvalidSerialStateException When part of the key is present.
+     */
+    private function assertFaceIsWholeOrAbsent(SerialNumberDto $serial, string $serialNo): void
+    {
+        $given = 0;
+
+        if ($serial->locCode !== null && $serial->locCode !== '') {
+            $given++;
+        }
+
+        foreach (array($serial->aisleId, $serial->shelfId, $serial->binId) as $part) {
+            if ($part !== null) {
+                $given++;
+            }
+        }
+
+        if ($given === 0 || $given === 4) {
+            return;
+        }
+
+        throw new InvalidSerialStateException(
+            'Serial ' . $serialNo . ' needs locCode, aisleId, shelfId and binId together; got '
+            . $given . ' of 4'
+        );
     }
 
     /**
@@ -184,15 +273,23 @@ class SerialNumberService
      *
      * @param string   $serialNo
      * @param string   $toLocCode
+     * @param int|null $toAisleId
      * @param int|null $toShelfId
+     * @param int|null $toBinId   The destination pick face.
      * @param string   $reason
      * @return SerialNumberDto
      * @throws SerialNotFoundException
      * @throws InvalidSerialStateException
      */
-    public function move(string $serialNo, string $toLocCode, ?int $toShelfId = null, string $reason = 'transfer'): SerialNumberDto
-    {
-        return $this->assignLocation($serialNo, $toLocCode, $toShelfId, $reason);
+    public function move(
+        string $serialNo,
+        string $toLocCode,
+        ?int $toAisleId = null,
+        ?int $toShelfId = null,
+        ?int $toBinId = null,
+        string $reason = 'transfer'
+    ): SerialNumberDto {
+        return $this->assignLocation($serialNo, $toLocCode, $toAisleId, $toShelfId, $toBinId, $reason);
     }
 
     /**
@@ -222,19 +319,40 @@ class SerialNumberService
     /**
      * Record the sale and start the warranty clock.
      *
-     * The warranty clock runs from installedDate, not soldDate: a unit sitting
-     * in a warehouse for three months before install should not have burned
-     * three months of cover.
+     * The warranty clock runs from installedDate, which is set to the sale date
+     * here: a unit sitting in a warehouse for three months before install should
+     * not have burned three months of cover.
+     *
+     * Ownership is appended to the xref, not written over a column. A resale
+     * therefore closes the previous owner's period and opens a new one, and the
+     * whole trail survives.
      *
      * @param string      $serialNo
-     * @param string      $soldTo   Customer identifier.
-     * @param string      $onDate   'Y-m-d'
+     * @param string      $ownerRef  Owner id within $ownerKind.
+     * @param string      $onDate    'Y-m-d'
      * @param int         $warrantyDays 0 for no warranty.
+     * @param string      $ownerKind One of the OwnershipDto::KIND_* constants.
      * @return SerialNumberDto
-     * @throws InvalidSerialStateException
+     * @throws InvalidSerialStateException When the kind is not permitted, or the
+     *         unit cannot be sold from its current state.
      */
-    public function markSold(string $serialNo, string $soldTo, string $onDate, int $warrantyDays = 0): SerialNumberDto
-    {
+    public function markSold(
+        string $serialNo,
+        string $ownerRef,
+        string $onDate,
+        int $warrantyDays = 0,
+        string $ownerKind = OwnershipDto::KIND_DEBTOR
+    ): SerialNumberDto {
+        if (!OwnershipDto::isValidKind($ownerKind)) {
+            throw new InvalidSerialStateException(
+                'Owner kind must be one of: ' . implode(', ', OwnershipDto::kinds())
+            );
+        }
+
+        if (trim($ownerRef) === '') {
+            throw new InvalidSerialStateException('An owner reference is required to sell a serial');
+        }
+
         $serial = $this->get($serialNo);
 
         if (!in_array(SerialNumberDto::STATUS_INSTALLED, self::TRANSITIONS[$serial->status], true)) {
@@ -244,8 +362,6 @@ class SerialNumberService
         }
 
         $serial->status = SerialNumberDto::STATUS_INSTALLED;
-        $serial->soldTo = $soldTo;
-        $serial->soldDate = $onDate;
         $serial->installedDate = $onDate;
 
         if ($warrantyDays > 0) {
@@ -255,9 +371,84 @@ class SerialNumberService
         }
 
         $this->repo->update($serial);
-        $this->logMove($serial, $serial->locCode, $serial->shelfId, 'sold');
+
+        // Close any previous owner's period before opening this one, so a resale
+        // keeps the earlier holder on record.
+        $this->owners()->closeCurrent($serialNo, $onDate);
+
+        $ownership = new OwnershipDto($serialNo, $ownerKind, trim($ownerRef), $onDate);
+        $this->owners()->open($ownership);
+
+        $this->logMove($serial, $serial->pickFace(), 'sold');
 
         return $serial;
+    }
+
+    /**
+     * Who currently holds this unit?
+     *
+     * @param string $serialNo
+     * @return OwnershipDto|null Null when it has never been sold.
+     * @throws InvalidSerialStateException
+     */
+    public function currentOwner(string $serialNo): ?OwnershipDto
+    {
+        // Proves the serial exists, so a typo reports "no such serial" rather than
+        // a silent null that reads as "never sold".
+        $this->get($serialNo);
+
+        return $this->owners()->current($serialNo);
+    }
+
+    /**
+     * Full ownership history, oldest first.
+     *
+     * @param string $serialNo
+     * @return OwnershipDto[]
+     * @throws InvalidSerialStateException
+     */
+    public function ownershipHistory(string $serialNo): array
+    {
+        $this->get($serialNo);
+
+        return $this->owners()->history($serialNo);
+    }
+
+    /**
+     * Who held this unit on a given date?
+     *
+     * This is the question warranty entitlement actually turns on: the same unit
+     * can have different owners on different dates.
+     *
+     * @param string $serialNo
+     * @param string $onDate   'Y-m-d'
+     * @return OwnershipDto|null
+     * @throws InvalidSerialStateException
+     */
+    public function ownerAsAt(string $serialNo, string $onDate): ?OwnershipDto
+    {
+        $this->get($serialNo);
+
+        return $this->owners()->ownerAsAt($serialNo, $onDate);
+    }
+
+    /**
+     * Every unit currently held by one owner of a given kind.
+     *
+     * @param string $ownerKind One of the OwnershipDto::KIND_* constants.
+     * @param string $ownerRef
+     * @return OwnershipDto[]
+     * @throws InvalidSerialStateException
+     */
+    public function unitsHeldBy(string $ownerKind, string $ownerRef): array
+    {
+        if (!OwnershipDto::isValidKind($ownerKind)) {
+            throw new InvalidSerialStateException(
+                'Owner kind must be one of: ' . implode(', ', OwnershipDto::kinds())
+            );
+        }
+
+        return $this->owners()->heldBy($ownerKind, $ownerRef);
     }
 
     /**
@@ -278,13 +469,16 @@ class SerialNumberService
         }
 
         $serial->status = SerialNumberDto::STATUS_RETURNED;
-        $serial->soldTo = null;
-        $serial->soldDate = null;
         $serial->installedDate = null;
         $serial->warrantyEnd = null;
 
         $this->repo->update($serial);
-        $this->logMove($serial, $serial->locCode, $serial->shelfId, 'return');
+
+        // Close the ownership period rather than deleting the row: the unit went
+        // back to unsold stock, and that fact belongs in the trail.
+        $this->owners()->closeCurrent($serialNo, $this->today());
+
+        $this->logMove($serial, $serial->pickFace(), 'return');
 
         return $serial;
     }
@@ -302,7 +496,14 @@ class SerialNumberService
         $serial = $this->transition($serialNo, SerialNumberDto::STATUS_AVAILABLE);
 
         if ($locCode !== null && $locCode !== '' && $locCode !== $serial->locCode) {
-            return $this->assignLocation($serialNo, $locCode, $serial->shelfId, 'put-back');
+            return $this->assignLocation(
+                $serialNo,
+                $locCode,
+                $serial->aisleId,
+                $serial->shelfId,
+                $serial->binId,
+                'put-back'
+            );
         }
 
         return $serial;
@@ -330,12 +531,16 @@ class SerialNumberService
             );
         }
 
+        $from = $serial->pickFace();
+
         $serial->status = SerialNumberDto::STATUS_RETIRED;
         $serial->locCode = null;
+        $serial->aisleId = null;
         $serial->shelfId = null;
+        $serial->binId = null;
 
         $this->repo->update($serial);
-        $this->logMove($serial, null, null, $reason);
+        $this->logMove($serial, $from, $reason);
 
         return $serial;
     }
@@ -421,25 +626,50 @@ class SerialNumberService
     /**
      * Append to the audit trail.
      *
-     * @param SerialNumberDto $serial
-     * @param string|null     $fromLoc
-     * @param int|null        $fromShelf
-     * @param string          $reason
+     * The log records the whole scoped key at both ends, so the trail can be
+     * replayed to reconstruct where a unit has been.
+     *
+     * @param SerialNumberDto                  $serial
+     * @param array{loc_code:string,aisle_id:int,shelf_id:int,bin_id:int}|null $from
+     * @param string                           $reason
      * @return void
      */
-    private function logMove(SerialNumberDto $serial, ?string $fromLoc, ?int $fromShelf, string $reason): void
+    private function logMove(SerialNumberDto $serial, ?array $from, string $reason): void
     {
         $move = new SerialMoveDto();
         $move->serialNo = $serial->serialNo;
-        $move->fromLocCode = $fromLoc;
+        $move->fromLocCode = $from === null ? null : $from['loc_code'];
+        $move->fromAisleId = $from === null ? null : $from['aisle_id'];
+        $move->fromShelfId = $from === null ? null : $from['shelf_id'];
+        $move->fromBinId   = $from === null ? null : $from['bin_id'];
         $move->toLocCode = $serial->locCode;
-        $move->fromShelfId = $fromShelf;
+        $move->toAisleId = $serial->aisleId;
         $move->toShelfId = $serial->shelfId;
+        $move->toBinId   = $serial->binId;
         $move->reason = $reason;
         $move->movedBy = function_exists('get_current_user') ? get_current_user() : null;
         $move->movedAt = $this->now !== null ? $this->now : date('Y-m-d H:i:s');
 
         $this->repo->appendMove($move);
+    }
+
+    /**
+     * Today, honouring the injected clock.
+     *
+     * Everything else in this class dates from $now when it is supplied, so
+     * calling date() directly would make one code path disagree with the rest --
+     * a return booked under an injected 2026-03-01 would close the ownership
+     * period on the real wall-clock date.
+     *
+     * @return string 'Y-m-d'
+     */
+    private function today(): string
+    {
+        if ($this->now !== null) {
+            return substr($this->now, 0, 10);
+        }
+
+        return date('Y-m-d');
     }
 
     /**
