@@ -168,4 +168,32 @@ class InMemorySerialRepository implements SerialRepositoryInterface
     {
         $this->insert($serial);
     }
+
+    /**
+     * Convenience seeding for a unit that is simply on a shelf.
+     *
+     * @param string $serialNo
+     * @param string $itemCode
+     * @param string $status   One of the SerialNumberDto::STATUS_* constants.
+     * @param bool   $shelved  Give it a complete pick face.
+     * @return void
+     */
+    public function seedWithStatus(
+        string $serialNo,
+        string $itemCode,
+        string $status = SerialNumberDto::STATUS_AVAILABLE,
+        bool $shelved = true
+    ): void {
+        $serial = new SerialNumberDto($serialNo, $itemCode);
+        $serial->status = $status;
+
+        if ($shelved) {
+            $serial->locCode = 'MAIN';
+            $serial->aisleId = 4;
+            $serial->shelfId = 2;
+            $serial->binId = 3;
+        }
+
+        $this->insert($serial);
+    }
 }
