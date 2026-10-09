@@ -123,3 +123,27 @@ CREATE TABLE IF NOT EXISTS `0_ksf_serial_ownership` (
   KEY `idx_owner` (`owner_kind`,`owner_ref`),
   KEY `idx_serial_from` (`serial_no`,`owned_from`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8;
+
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Item-level serial control (FR-SN-004-001)
+--
+-- FA's 0_stock_master has no flag for "this item needs a serial": its columns are
+-- category, tax, accounts, dimensions, depreciation, and nothing about serial
+-- tracking. Without this table the scan resolver cannot tell an ordinary item
+-- from one where a serial MUST be supplied, so it would let a serial-controlled
+-- line be picked with no serial at all.
+--
+-- warranty_days is the default cover for this item, applied when it is sold.
+-- It is a default, not a record: an individual unit's cover lives in
+-- 0_ksf_serial_numbers.warranty_end.
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS `0_ksf_serial_control` (
+  `id`             INT(11) NOT NULL AUTO_INCREMENT,
+  `item_code`      VARCHAR(20) NOT NULL,
+  `requires_serial` TINYINT(1) NOT NULL DEFAULT 1,
+  `warranty_days`  INT(11) NOT NULL DEFAULT 0,
+  `note`           VARCHAR(255) DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uniq_item` (`item_code`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8;

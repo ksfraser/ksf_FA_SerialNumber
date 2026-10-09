@@ -144,7 +144,7 @@ class hooks_ksf_FA_SerialNumber extends hooks
             'serial_register',
             'serial_lookup',
             'serial_at_location',
-            'serial_at_shelf',
+            'serial_at_face',
             'serial_move',
             'serial_sell',
             'serial_return',
@@ -196,7 +196,9 @@ class hooks_ksf_FA_SerialNumber extends hooks
         $readOnly = array(
             'serial_lookup'      => 'handleLookup',
             'serial_at_location' => 'handleAtLocation',
-            'serial_at_shelf'    => 'handleAtShelf',
+            'serial_at_face'     => 'handleAtFace',
+            'scan_resolve'       => 'handleScanResolve',
+            'serial_control'     => 'handleSerialControl',
             'serial_history'     => 'handleHistory',
             'warranty_cover'     => 'handleWarrantyCover',
             'batch_allocate'     => 'handleBatchAllocate',
@@ -220,6 +222,16 @@ class hooks_ksf_FA_SerialNumber extends hooks
     }
 
     /**
+     * This module's root namespace, with a trailing separator.
+     *
+     * @return string
+     */
+    private function ns(): string
+    {
+        return 'ksfraser\\FrontAccounting\\SerialNumber\\';
+    }
+
+    /**
      * Build the service and repositories, or null when the vendor is absent.
      *
      * @return array|null [SerialNumberService, FaSerialRepository, FaBatchRepository,
@@ -227,7 +239,7 @@ class hooks_ksf_FA_SerialNumber extends hooks
      */
     private function services()
     {
-        $ns = 'ksfraser\\FrontAccounting\\SerialNumber\\';
+        $ns = $this->ns();
 
         if (!class_exists($ns . 'Service\\SerialNumberService')) {
             return null;
@@ -304,25 +316,42 @@ class hooks_ksf_FA_SerialNumber extends hooks
     }
 
     /**
-     * serial_at_shelf: serials on a warehouse shelf.
+     * serial_at_face: serials on one warehouse pick face.
      *
-     * shelf_id stays an opaque reference -- resolving it to an aisle/bin is
-     * ksf_FA_Warehouse's job, and this module must not read its tables.
+     * The WHOLE scoped key is required, not just a shelf: the warehouse's ids are
+     * meaningful indices scoped by parent, so shelf 2 of aisle 4 and shelf 2 of
+     * aisle 9 are different shelves. A bare shelf_id would return units from
+     * every aisle that reuses the number.
      *
      * @param array &$data
-     * @param array $opts
+     * @param array $opts Requires loc_code, aisle_id, shelf_id, bin_id.
      * @return array|null
      */
-    private function handleAtShelf(&$data, $opts = array())
+    private function handleAtFace(&$data, $opts = array())
     {
+        $required = array('loc_code', 'aisle_id', 'shelf_id', 'bin_id');
+
+        foreach ($required as $key) {
+            if (!isset($opts[$key])) {
+                return null;
+            }
+        }
+
         $s = $this->services();
-        if ($s === null || !isset($opts['shelf_id'])) {
+        if ($s === null) {
             return null;
         }
 
         $rows = array();
 
-        foreach ($s[1]->findByShelf((int)$opts['shelf_id']) as $serial) {
+        $serials = $s[1]->findByFace(
+            (string)$opts['loc_code'],
+            (int)$opts['aisle_id'],
+            (int)$opts['shelf_id'],
+            (int)$opts['bin_id']
+        );
+
+        foreach ($serials as $serial) {
             $row = $serial->toArray();
             $row['_module'] = $this->module_name;
             $row['_entity'] = 'serial_number';
@@ -330,6 +359,92 @@ class hooks_ksf_FA_SerialNumber extends hooks
         }
 
         return $rows;
+    }
+
+    /**
+     * scan_resolve: turn a scanned code into something pickable.
+     *
+     * This is the capability other modules need in order to enforce serial
+     * capture on a cart line. FA has no cart-line validation hook, so the only
+     * place a serial can be required is here.
+     *
+     * Returns a ScanResolution array whose 'kind' is one of:
+     *   item                 -> pickable as scanned
+     *   item_requires_serial -> NOT pickable; a serial is mandatory
+     *   serial               -> resolves to an SKU and a bin
+     *   unknown              -> nothing matches
+     *
+     * @param array &$data
+     * @param array $opts Requires 'code'.
+     * @return array|null Null when there is no resolver, so a responder declines
+     *         rather than reporting "unknown" for a request it could not answer.
+     */
+    private function handleScanResolve(&$data, $opts = array())
+    {
+        if (!isset($opts['code'])) {
+            return null;
+        }
+
+        $s = $this->services();
+        if ($s === null) {
+            return null;
+        }
+
+        $resolver = new $this->ns() . 'Service\\ScanResolver'(
+            $s[1],
+            new $this->ns() . 'Adapter\\FaItemControlRepository'(),
+            new $this->ns() . 'Adapter\\FaItemLookup'()
+        );
+
+        // Resolved once: calling resolve() twice would mean two database round
+        // trips and could disagree if the unit moved between them.
+        $resolution = $resolver->resolve((string)$opts['code']);
+
+        $row = $resolution->toArray();
+        $row['_module'] = $this->module_name;
+        $row['_entity'] = 'scan_resolution';
+        $row['_describe'] = $resolution->describe();
+
+        return $row;
+    }
+
+    /**
+     * serial_control: manage which items are serial-controlled.
+     *
+     * FA's 0_stock_master has no "needs a serial" flag, so this is how an item
+     * is marked. Without it a machine could be picked with no serial recorded.
+     *
+     * @param array &$data
+     * @param array $opts Requires 'item_code'; 'warranty_days' and 'release'.
+     * @return array|null
+     */
+    private function handleSerialControl(&$data, $opts = array())
+    {
+        if (!isset($opts['item_code'])) {
+            return null;
+        }
+
+        $s = $this->services();
+        if ($s === null) {
+            return null;
+        }
+
+        $control = new $this->ns() . 'Adapter\\FaItemControlRepository'();
+        $itemCode = (string)$opts['item_code'];
+
+        if (!empty($opts['release'])) {
+            $control->release($itemCode);
+        } else {
+            $control->control($itemCode, isset($opts['warranty_days']) ? (int)$opts['warranty_days'] : 0);
+        }
+
+        return array(
+            'item_code'      => $itemCode,
+            'requires_serial' => $control->requiresSerial($itemCode),
+            'warranty_days'  => $control->warrantyDays($itemCode),
+            '_module'        => $this->module_name,
+            '_entity'        => 'serial_control',
+        );
     }
 
     /**

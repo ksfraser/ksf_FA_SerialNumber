@@ -219,6 +219,46 @@ class ModuleConventionsTest extends TestCase
         $this->assertStringContainsString('156 << 8', $hooks);
     }
 
+    /**
+     * Every class hooks.php instantiates must actually exist at the path its
+     * namespace implies.
+     *
+     * hooks.php builds names as $this->ns() . 'Service\\ScanResolver'. A typo in
+     * the prefix, a stale prefix, or a class that was moved would produce a name
+     * that silently does not exist, and the first symptom would be a fatal on
+     * activation -- not a failing test.
+     *
+     * @return void
+     */
+    public function testEveryClassHooksReferencesExists(): void
+    {
+        $hooks = file_get_contents($this->root . '/hooks.php');
+        $ns = 'ksfraser\\FrontAccounting\\SerialNumber\\';
+
+        preg_match_all(
+            '/(?:new|::class_from_)?\s*\$this->ns\(\)\s*\.\s*\'([A-Za-z\\\\]+)\'/',
+            $hooks,
+            $matches
+        );
+
+        $missing = array();
+
+        foreach ($matches[1] as $relative) {
+            $relative = trim($relative, "\\\\");
+            $path = $this->root . '/src/' . str_replace('\\\\', '/', $relative) . '.php';
+
+            if (!file_exists($path)) {
+                $missing[] = $relative . ' -> ' . $path;
+            }
+        }
+
+        $this->assertSame(
+            array(),
+            $missing,
+            "every class hooks.php builds from ns() must exist:\n  " . implode("\n  ", $missing)
+        );
+    }
+
     public function testHooksClassAndModuleNameAgree(): void
     {
         $hooks = (string)file_get_contents($this->root . '/hooks.php');
