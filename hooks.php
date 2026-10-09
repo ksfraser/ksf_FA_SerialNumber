@@ -31,7 +31,7 @@ class hooks_ksf_FA_SerialNumber extends hooks
     var $module_name = 'ksf_FA_SerialNumber';
 
     /** @var string Module version. */
-    var $version = '1.0.0';
+    var $version = '2.4.19-0';
 
     /**
      * Load the module composer autoloader if present.
