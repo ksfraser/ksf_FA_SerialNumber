@@ -153,6 +153,10 @@ class hooks_ksf_FA_SerialNumber extends hooks
             'warranty_cover',
             'warranty_extend',
             'batch_allocate',
+            'scan_resolve',
+            'serial_control',
+            'serial_capture_assign',
+            'serial_action',
         );
     }
 
@@ -199,19 +203,28 @@ class hooks_ksf_FA_SerialNumber extends hooks
             'serial_at_face'     => 'handleAtFace',
             'scan_resolve'       => 'handleScanResolve',
             'serial_control'     => 'handleSerialControl',
+            'serial_capture_assign' => 'handleCaptureAssign',
             'serial_history'     => 'handleHistory',
             'warranty_cover'     => 'handleWarrantyCover',
             'batch_allocate'     => 'handleBatchAllocate',
         );
 
-        if (!isset($readOnly[$request])) {
+        // WRITE actions. These must be reached with hook_invoke_first, never
+        // hook_invoke_all: two modules moving the same serial must not race.
+        // They live behind one capability so the caller has a single entry point
+        // and one place to be careful.
+        $writes = array(
+            'serial_action' => 'handleSerialAction',
+        );
+
+        if (!isset($readOnly[$request]) && !isset($writes[$request])) {
             // Decline: null means "not mine", never false.
             return null;
         }
 
         $this->loadAutoloader();
 
-        $method = $readOnly[$request];
+        $method = isset($readOnly[$request]) ? $readOnly[$request] : $writes[$request];
 
         try {
             return $this->{$method}($data, $opts);
@@ -234,8 +247,11 @@ class hooks_ksf_FA_SerialNumber extends hooks
     /**
      * Build the service and repositories, or null when the vendor is absent.
      *
-     * @return array|null [SerialNumberService, FaSerialRepository, FaBatchRepository,
-     *                      WarrantyService, BatchNumberService, FaOwnershipRepository]
+     * @return array|null [0] SerialNumberService   [1] FaSerialRepository
+     *                   [2] FaBatchRepository     [3] WarrantyService
+     *                   [4] BatchNumberService    [5] FaOwnershipRepository
+     *                   [6] DeliverySerialCapture [7] DeliverySerialGate
+     *                   [8] DeliverySerialCommit  [9] FaItemControlRepository
      */
     private function services()
     {
@@ -392,7 +408,7 @@ class hooks_ksf_FA_SerialNumber extends hooks
 
         $resolver = new $this->ns() . 'Service\\ScanResolver'(
             $s[1],
-            new $this->ns() . 'Adapter\\FaItemControlRepository'(),
+            $s[9],
             new $this->ns() . 'Adapter\\FaItemLookup'()
         );
 
@@ -540,5 +556,472 @@ class hooks_ksf_FA_SerialNumber extends hooks
             '_module'     => $this->module_name,
             '_entity'     => 'batch_allocation',
         );
+    }
+
+    /**
+     * pre_header: refuse to let a delivery through while a serial is missing.
+     *
+     * FA has no cart-line validation hook and ignores db_prewrite return values,
+     * so there is no way to veto a delivery from a hook. pre_header is what is
+     * left: it runs at includes/page/header.inc:132, before any output and before
+     * the submit completes, so redirecting from here is the only enforcement point
+     * that exists.
+     *
+     * The DI cart is created at sales_order_entry.php:62-69 and page() is called
+     * at line 102, so the cart is already populated when this fires.
+     *
+     * This must be cheap and must never loop: it returns immediately unless the
+     * current page is the sales order entry page and the cart is a delivery or
+     * invoice.
+     *
+     * @param array $args FA page_header arguments, by reference.
+     * @return void
+     */
+    public function pre_header(&$args)
+    {
+        if (!$this->isSalesOrderEntryPage()) {
+            return;
+        }
+
+        $s = $this->services();
+        if ($s === null) {
+            return;
+        }
+
+        $cart = $this->cart();
+        if ($cart === null || !in_array($cart->trans_type, array(ST_CUSTDELIVERY, ST_SALESINVOICE), true)) {
+            return;
+        }
+
+        // Re-apply anything the picker already scanned for THIS order.
+        $requirements = $s[7]->requirementsFromCart($cart->get_items());
+        $this->reapplyCapturedSerials($requirements, (int)$cart->order_no);
+
+        $url = $s[7]->redirectFor(
+            $requirements,
+            (int)$cart->order_no,
+            $this->pathToRoot(),
+            'modules/' . $this->module_name . '/serial_capture.php'
+        );
+
+        if ($url === null) {
+            return;
+        }
+
+        // No output has happened yet at header.inc:132, so this is safe.
+        header('Location: ' . $url);
+        exit;
+    }
+
+    /**
+     * db_postwrite: bind the captured serials to the delivery that now exists.
+     *
+     * FA calls hook_db_postwrite($delivery, ST_CUSTDELIVERY) at
+     * sales/includes/db/sales_delivery_db.inc:200 and commit_transaction() is the
+     * very next line, so this is the first moment the delivery has a number AND we
+     * are still inside the transaction. A failure here rolls the delivery back,
+     * which is the behaviour we want: a machine delivered with no serial recorded
+     * is the loss this whole design exists to prevent.
+     *
+     * @param object $delivery   FA sales_cart / sales_order.
+     * @param int    $trans_type One of the ST_* constants.
+     * @return void
+     */
+    public function db_postwrite($delivery, $trans_type)
+    {
+        // ST_CUSTDELIVERY only. An invoice from an already-delivered order has
+        // nothing left to capture -- the serials were bound at delivery.
+        if ($trans_type !== ST_CUSTDELIVERY) {
+            return;
+        }
+
+        $s = $this->services();
+        if ($s === null || !is_object($delivery)) {
+            return;
+        }
+
+        $requirements = $s[6]->requirementsFromCart($delivery->get_items());
+
+        if (empty($requirements)) {
+            return;
+        }
+
+        $this->reapplyCapturedSerials($requirements, (int)$delivery->order_no);
+
+        $serials = $this->collectAssignedSerials($requirements);
+
+        if (empty($serials)) {
+            return;
+        }
+
+        $ownerRef = (string)$delivery->customer_id;
+        $onDate = date('Y-m-d');
+
+        $s[8]->commit($requirements, (int)$delivery->trans_no, $onDate, 'debtor', $ownerRef);
+
+        // The delivery is saved; the picker must not be sent back for the same
+        // serials on the next order.
+        $this->forgetCapturedSerials((int)$delivery->order_no);
+    }
+
+    /**
+     * Is the page currently being rendered the sales order entry page?
+     *
+     * Scoped narrowly on purpose: pre_header fires on EVERY page, so a broad test
+     * would either gate unrelated pages or fail to gate this one.
+     *
+     * @return bool
+     */
+    private function isSalesOrderEntryPage(): bool
+    {
+        $script = isset($_SERVER['SCRIPT_NAME']) ? (string)$_SERVER['SCRIPT_NAME'] : '';
+
+        return basename($script) === 'sales_order_entry.php';
+    }
+
+    /**
+     * FA's current sales cart, or null when there is not one.
+     *
+     * @return object|null
+     */
+    private function cart()
+    {
+        return isset($_SESSION['Items']) && is_object($_SESSION['Items']) ? $_SESSION['Items'] : null;
+    }
+
+    /**
+     * @return string
+     */
+    private function pathToRoot(): string
+    {
+        global $path_to_root;
+
+        return isset($path_to_root) ? (string)$path_to_root : '';
+    }
+
+    /**
+     * Session key holding the serials scanned for an order.
+     *
+     * @return string
+     */
+    private function captureSessionKey(): string
+    {
+        return 'ksf_serial_capture';
+    }
+
+    /**
+     * Copy the picker's scanned serials onto a freshly built requirement set.
+     *
+     * The requirement set is rebuilt on every page render, so the scanned serials
+     * have to be replayed onto it rather than stored on it.
+     *
+     * @param array $requirements CartSerialRequirement[], by reference.
+     * @param int   $orderNo
+     * @return void
+     */
+    private function reapplyCapturedSerials(array &$requirements, int $orderNo)
+    {
+        if ($orderNo <= 0) {
+            return;
+        }
+
+        $stored = $this->capturedSerials($orderNo);
+
+        foreach ($stored as $itemCode => $serialNos) {
+            if (!isset($requirements[$itemCode])) {
+                continue;
+            }
+
+            foreach ((array)$serialNos as $serialNo) {
+                $requirements[$itemCode]->assignedSerials[] = (string)$serialNo;
+            }
+        }
+    }
+
+    /**
+     * @param int $orderNo
+     * @return array
+     */
+    private function capturedSerials(int $orderNo): array
+    {
+        $key = $this->captureSessionKey();
+
+        if (empty($_SESSION[$key][$orderNo]) || !is_array($_SESSION[$key][$orderNo])) {
+            return array();
+        }
+
+        return $_SESSION[$key][$orderNo];
+    }
+
+    /**
+     * @param array $requirements
+     * @return string[]
+     */
+    private function collectAssignedSerials(array $requirements): array
+    {
+        $out = array();
+
+        foreach ($requirements as $requirement) {
+            foreach ($requirement->assignedSerials as $serialNo) {
+                $out[] = $serialNo;
+            }
+        }
+
+        return $out;
+    }
+
+    /**
+     * @param int $orderNo
+     * @return void
+     */
+    private function forgetCapturedSerials(int $orderNo)
+    {
+        unset($_SESSION[$this->captureSessionKey()][$orderNo]);
+    }
+
+    /**
+     * serial_action: perform a write against a serial.
+     *
+     * ONE entry point for every write, so a caller reaches this with
+     * hook_invoke_first and gets a typed action rather than six loosely related
+     * capabilities.
+     *
+     * $opts['action'] is one of:
+     *   register  requires serial_no, item_code
+     *   move      requires serial_no, loc_code, aisle_id, shelf_id, bin_id
+     *   sell      requires serial_no, owner_ref, on_date, warranty_days,
+     *             owner_kind
+     *   return    requires serial_no
+     *   retire    requires serial_no
+     *
+     * The whole scoped pick face is required for a move: a bare shelf id is
+     * ambiguous (FR-SN-003-001).
+     *
+     * @param array &$data
+     * @param array $opts
+     * @return array|null Null when FA is not loadable, so the caller knows the
+     *         action did NOT happen rather than believing it did.
+     */
+    private function handleSerialAction(&$data, $opts = array())
+    {
+        $s = $this->services();
+        if ($s === null) {
+            return null;
+        }
+
+        $serials = $s[0];
+        $action = isset($opts['action']) ? (string)$opts['action'] : '';
+
+        try {
+            switch ($action) {
+                case 'register':
+                    $result = $serials->register(
+                        isset($opts['serial_no']) ? (string)$opts['serial_no'] : '',
+                        isset($opts['item_code']) ? (string)$opts['item_code'] : '',
+                        array(
+                            'locCode'     => isset($opts['loc_code']) ? $opts['loc_code'] : null,
+                            'aisleId'     => isset($opts['aisle_id']) ? (int)$opts['aisle_id'] : null,
+                            'shelfId'     => isset($opts['shelf_id']) ? (int)$opts['shelf_id'] : null,
+                            'binId'       => isset($opts['bin_id']) ? (int)$opts['bin_id'] : null,
+                            'purchaseDate' => isset($opts['purchase_date']) ? $opts['purchase_date'] : null,
+                            'purchaseCost' => isset($opts['purchase_cost']) ? (float)$opts['purchase_cost'] : null,
+                            'currency'    => isset($opts['currency']) ? $opts['currency'] : null,
+                            'supplierRef' => isset($opts['supplier_ref']) ? $opts['supplier_ref'] : null,
+                            'warrantyEnd' => isset($opts['warranty_end']) ? $opts['warranty_end'] : null,
+                            'notes'       => isset($opts['notes']) ? $opts['notes'] : null,
+                        )
+                    );
+                    break;
+
+                case 'move':
+                    $result = $serials->move(
+                        isset($opts['serial_no']) ? (string)$opts['serial_no'] : '',
+                        isset($opts['loc_code']) ? (string)$opts['loc_code'] : '',
+                        isset($opts['aisle_id']) ? (int)$opts['aisle_id'] : null,
+                        isset($opts['shelf_id']) ? (int)$opts['shelf_id'] : null,
+                        isset($opts['bin_id']) ? (int)$opts['bin_id'] : null,
+                        isset($opts['reason']) ? (string)$opts['reason'] : 'transfer'
+                    );
+                    break;
+
+                case 'sell':
+                    $result = $serials->markSold(
+                        isset($opts['serial_no']) ? (string)$opts['serial_no'] : '',
+                        isset($opts['owner_ref']) ? (string)$opts['owner_ref'] : '',
+                        isset($opts['on_date']) ? (string)$opts['on_date'] : date('Y-m-d'),
+                        isset($opts['warranty_days']) ? (int)$opts['warranty_days'] : 0,
+                        isset($opts['owner_kind']) ? (string)$opts['owner_kind'] : 'debtor'
+                    );
+                    break;
+
+                case 'return':
+                    $result = $serials->returnSerial(
+                        isset($opts['serial_no']) ? (string)$opts['serial_no'] : ''
+                    );
+                    break;
+
+                case 'retire':
+                    $result = $serials->retire(
+                        isset($opts['serial_no']) ? (string)$opts['serial_no'] : '',
+                        isset($opts['reason']) ? (string)$opts['reason'] : 'retired'
+                    );
+                    break;
+
+                default:
+                    // Unknown action: decline, so the caller is not told a write
+                    // happened when none did.
+                    return null;
+            }
+        } catch (\Exception $e) {
+            // A refused transition is an ANSWER, not a crash: the caller asked for
+            // something illegal and needs to know why.
+            return array(
+                'accepted' => false,
+                'reason'   => $e->getMessage(),
+                '_entity'  => 'serial_action',
+                '_module'  => $this->module_name,
+            );
+        }
+
+        return array(
+            'accepted' => true,
+            'action'   => $action,
+            'serial'   => $result->toArray(),
+            '_entity'  => 'serial_action',
+            '_module'  => $this->module_name,
+        );
+    }
+
+    /**
+     * serial_capture_assign: record one scanned serial against an order line.
+     *
+     * This is what the capture page calls. The gate reads the same session, so
+     * recording here is exactly what releases the delivery.
+     *
+     * @param array &$data
+     * @param array $opts Requires 'order_no' and 'code'; optional 'item_code'.
+     * @return array|null
+     */
+    private function handleCaptureAssign(&$data, $opts = array())
+    {
+        if (!isset($opts['order_no']) || !isset($opts['code'])) {
+            return null;
+        }
+
+        $s = $this->services();
+        if ($s === null) {
+            return null;
+        }
+
+        $orderNo = (int)$opts['order_no'];
+        $requirements = $this->captureRequirementsForOrder($orderNo);
+
+        if ($requirements === null) {
+            return null;
+        }
+
+        $itemCode = isset($opts['item_code']) ? trim((string)$opts['item_code']) : '';
+
+        // No line named: work the item out from the scan itself.
+        if ($itemCode === '') {
+            $scanner = new $this->ns() . 'Service\\ScanResolver'(
+                $s[1],
+                $s[9],
+                new $this->ns() . 'Adapter\\FaItemLookup'()
+            );
+
+            $scan = $scanner->resolve((string)$opts['code']);
+
+            if ($scan->itemCode === null) {
+                return array(
+                    'accepted' => false,
+                    'reason'   => $scan->describe(),
+                    '_entity'  => 'capture',
+                    '_module'  => $this->module_name,
+                    'order_no' => $orderNo,
+                );
+            }
+
+            $itemCode = (string)$scan->itemCode;
+        }
+
+        $result = $s[6]->assign($requirements, $itemCode, (string)$opts['code']);
+
+        if ($result['accepted']) {
+            $this->rememberCapturedSerial($orderNo, $itemCode, $requirements[$itemCode]->assignedSerials);
+        }
+
+        $result['_entity'] = 'capture';
+        $result['_module'] = $this->module_name;
+        $result['order_no'] = $orderNo;
+        $result['item_code'] = $itemCode;
+        $result['still_needed'] = $s[6]->summarise($requirements);
+
+        return $result;
+    }
+
+    /**
+     * Remember the serials scanned for an order, keeping the stored list unique.
+     *
+     * @param int      $orderNo
+     * @param string   $itemCode
+     * @param string[] $serialNos The whole assigned list for that line.
+     * @return void
+     */
+    private function rememberCapturedSerial(int $orderNo, string $itemCode, array $serialNos): void
+    {
+        $key = $this->captureSessionKey();
+
+        if (empty($_SESSION[$key][$orderNo])) {
+            $_SESSION[$key][$orderNo] = array();
+        }
+
+        $_SESSION[$key][$orderNo][$itemCode] = array_values(array_unique($serialNos));
+    }
+
+    /**
+     * Rebuild an order's requirement set straight from FA's order lines.
+     *
+     * Reads get_sales_order_details() rather than building a cart: the cart would
+     * have to be constructed per document type, and the DI cart already exists for
+     * the page being gated anyway.
+     *
+     * @param int $orderNo
+     * @return array|null Null when FA cannot supply the lines.
+     */
+    private function captureRequirementsForOrder(int $orderNo)
+    {
+        $s = $this->services();
+
+        if ($s === null || $orderNo <= 0 || !function_exists('get_sales_order_details')) {
+            return null;
+        }
+
+        // An order with no lines produces no rows, which is a legitimate answer:
+        // there is nothing to capture.
+        $result = get_sales_order_details($orderNo, ST_SALESORDER);
+
+        if (!$result) {
+            return null;
+        }
+
+        $lines = array();
+
+        while ($line = db_fetch_assoc($result)) {
+            if (!isset($line['stk_code'])) {
+                continue;
+            }
+
+            $lines[] = array(
+                'stock_id' => $line['stk_code'],
+                // FA's order details call the quantity "quantity", not "qty".
+                'qty' => isset($line['quantity']) ? (float)$line['quantity'] : 0.0,
+            );
+        }
+
+        $requirements = $s[7]->requirementsFromCart($lines);
+        $this->reapplyCapturedSerials($requirements, $orderNo);
+
+        return $requirements;
     }
 }
