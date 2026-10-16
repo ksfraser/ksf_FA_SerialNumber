@@ -574,10 +574,10 @@ class hooks_ksf_FA_SerialNumber extends hooks
      * current page is the sales order entry page and the cart is a delivery or
      * invoice.
      *
-     * @param array $args FA page_header arguments, by reference.
+     * @param array $args FA page_header arguments.
      * @return void
      */
-    public function pre_header(&$args)
+    public function pre_header($args)
     {
         if (!$this->isSalesOrderEntryPage()) {
             return;
@@ -627,7 +627,7 @@ class hooks_ksf_FA_SerialNumber extends hooks
      * @param int    $trans_type One of the ST_* constants.
      * @return void
      */
-    public function db_postwrite($delivery, $trans_type)
+    public function db_postwrite(&$delivery, $trans_type)
     {
         // ST_CUSTDELIVERY only. An invoice from an already-delivered order has
         // nothing left to capture -- the serials were bound at delivery.
